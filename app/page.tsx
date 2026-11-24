@@ -4,6 +4,7 @@ import Image from "next/image";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { supabase } from "@/lib/client";
+import "./auth.css";
 
 type AuthMode = "login" | "signup";
 type SignupDialogState = "confirm-email" | "ready" | null;
@@ -18,8 +19,16 @@ const authErrorMessages: Record<string, string> = {
   request_timeout: "استغرق الاتصال وقتًا طويلًا. حاول مجددًا.",
 };
 
+/**
+ * Displays the account forms and routes authenticated visitors to their dashboard.
+ * 1. Verify an existing session before showing the forms.
+ * 2. Manage the signup confirmation dialog.
+ * 3. Submit login or signup requests.
+ * 4. Render the appropriate waiting or account view.
+ */
 export default function Home() {
   const router = useRouter();
+  const [isCheckingSession, setIsCheckingSession] = useState(true);
   const [mode, setMode] = useState<AuthMode>("login");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const submissionInProgress = useRef(false);
@@ -32,6 +41,40 @@ export default function Home() {
   } | null>(null);
   const isSignup = mode === "signup";
 
+  // STEP 1: Check the saved session before displaying account forms.
+  useEffect(() => {
+    let active = true;
+
+    /**
+     * Checks whether the visitor already has a valid Supabase account session.
+     * 1. Request the current user from Supabase Auth.
+     * 2. Send authenticated visitors to the dashboard.
+     * 3. Show the forms when no valid session is available.
+     */
+    async function checkExistingSession() {
+      try {
+        // STEP 1: Verify the current user against Supabase Auth.
+        const { data, error } = await supabase.auth.getUser();
+        if (!active) return;
+
+        // STEP 2: Redirect only when the session is valid.
+        if (!error && data.user) {
+          router.replace("/dashboard");
+          return;
+        }
+      } catch {
+        // NOTE: A failed network check should leave the sign-in form available.
+      }
+
+      // STEP 3: Let signed-out visitors use the account forms.
+      if (active) setIsCheckingSession(false);
+    }
+
+    void checkExistingSession();
+    return () => { active = false; };
+  }, [router]);
+
+  // STEP 2: Keep the confirmation dialog in sync with signup results.
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
@@ -44,6 +87,7 @@ export default function Home() {
     dialogRef.current?.close();
   }
 
+  // STEP 3: Handle login and signup submissions.
   /**
    * Submits the selected authentication form.
    * 1. Ignore duplicate submissions and validate the visible fields.
@@ -120,6 +164,16 @@ export default function Home() {
       submissionInProgress.current = false;
       setIsSubmitting(false);
     }
+  }
+
+  // STEP 4: Avoid showing the sign-in form while checking an existing session.
+  if (isCheckingSession) {
+    return (
+      <main className="auth-check" dir="rtl" role="status">
+        <span className="auth-check-spinner" aria-hidden="true" />
+        <span>جارٍ التحقق من حسابك...</span>
+      </main>
+    );
   }
 
   return (

@@ -1,0 +1,5 @@
+.auth-check { display: flex; align-items: center; justify-content: center; gap: 12px; min-height: 100vh; background: #f5f3ee; color: #536b58; font-size: 14px; }
+.auth-check-spinner { width: 20px; height: 20px; border: 2px solid #d3e0d3; border-top-color: #315e4b; border-radius: 50%; animation: auth-check-spin .8s linear infinite; }
+
+@keyframes auth-check-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .auth-check-spinner { animation: none; } }
