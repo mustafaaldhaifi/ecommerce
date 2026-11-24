@@ -1,11 +1,19 @@
 "use client";
 
+import Image from "next/image";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import type { User } from "@supabase/supabase-js";
 import { supabase } from "@/lib/client";
+import { products } from "./products";
 import "./dashboard.css";
 
+/**
+ * Displays the signed-in account and the local product catalog.
+ * 1. Verify the account and handle session changes.
+ * 2. Prepare the account name for the header.
+ * 3. Render the header and the product list.
+ */
 export default function Dashboard() {
   const router = useRouter();
   const [user, setUser] = useState<User | null>(null);
@@ -13,6 +21,7 @@ export default function Dashboard() {
   const [loadError, setLoadError] = useState("");
   const [signOutError, setSignOutError] = useState("");
 
+  // STEP 1: Keep account details tied to the current Supabase session.
   useEffect(() => {
     let active = true;
 
@@ -83,6 +92,7 @@ export default function Dashboard() {
     }
   }
 
+  // STEP 2: Build a readable name from the saved profile details.
   const firstName = typeof user?.user_metadata?.first_name === "string"
     ? user.user_metadata.first_name.trim()
     : "";
@@ -92,6 +102,7 @@ export default function Dashboard() {
   const displayName = [firstName, lastName].filter(Boolean).join(" ") || "مستخدم رِواء";
   const initial = firstName.charAt(0) || user?.email?.charAt(0).toUpperCase() || "ر";
 
+  // STEP 3: Show the catalog below the existing account header.
   return (
     <main className="dashboard-page" dir="rtl">
       <header className="dashboard-header">
@@ -123,7 +134,43 @@ export default function Dashboard() {
         </div>
         {signOutError && <p className="dashboard-error" role="alert">{signOutError}</p>}
       </header>
-      <div className="dashboard-empty" />
+      <section className="dashboard-catalog" aria-labelledby="catalog-title">
+        <div className="dashboard-catalog-heading">
+          <div>
+            <p className="dashboard-catalog-kicker">مجموعة رِواء للمنزل</p>
+            <h2 id="catalog-title">تفاصيل تجعل البيت أقرب إليك</h2>
+            <p className="dashboard-catalog-description">قطع مختارة للأثاث والإضاءة والديكور، بتصاميم هادئة تناسب كل زاوية.</p>
+          </div>
+          <span className="dashboard-product-count">{products.length} منتجًا</span>
+        </div>
+
+        <div className="dashboard-product-grid">
+          {products.map((product) => (
+            <article className="dashboard-product-card" key={product.id}>
+              <div className="dashboard-product-image">
+                {product.image ? (
+                  <Image
+                    src={product.image}
+                    alt={product.alt}
+                    fill
+                    sizes="(max-width: 560px) 100vw, (max-width: 850px) 50vw, (max-width: 1150px) 33vw, 25vw"
+                  />
+                ) : (
+                  <div className="dashboard-image-pending" aria-label="صورة المنتج ستضاف لاحقًا">
+                    <svg viewBox="0 0 64 64" fill="none" aria-hidden="true"><rect x="8" y="12" width="48" height="40" rx="6" stroke="currentColor" strokeWidth="2" /><circle cx="22" cy="25" r="4" stroke="currentColor" strokeWidth="2" /><path d="m12 46 13-13 10 9 7-6 10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                    <span>الصورة قريبًا</span>
+                  </div>
+                )}
+              </div>
+              <div className="dashboard-product-details">
+                <span className="dashboard-product-category">{product.category}</span>
+                <h3>{product.name}</h3>
+                <p className="dashboard-product-price">{product.price} <span>ر.س</span></p>
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
     </main>
   );
 }
