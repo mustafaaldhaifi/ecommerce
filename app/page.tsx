@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { supabase } from "@/lib/client";
 
@@ -18,6 +19,7 @@ const authErrorMessages: Record<string, string> = {
 };
 
 export default function Home() {
+  const router = useRouter();
   const [mode, setMode] = useState<AuthMode>("login");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const submissionInProgress = useRef(false);
@@ -47,7 +49,7 @@ export default function Home() {
    * 1. Ignore duplicate submissions and validate the visible fields.
    * 2. Lock the form while Supabase processes the selected action.
    * 3. Switch successful signups to login and show a confirmation dialog.
-   * 4. Show sign-in success or a useful error message.
+   * 4. Open the dashboard after sign-in or show a useful error message.
    * 5. Unlock the form after the request settles.
    */
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -100,8 +102,9 @@ export default function Home() {
       const { error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) throw error;
 
-      // STEP 4: Report successful sign-in without assuming a destination page.
-      setMessage({ type: "success", text: "تم تسجيل الدخول بنجاح." });
+      // STEP 4: Open the dashboard after successful sign-in.
+      setMessage({ type: "success", text: "تم تسجيل الدخول، جارٍ فتح لوحة التحكم..." });
+      router.replace("/dashboard");
     } catch (error) {
       // STEP 4: Explain known authentication failures and allow a retry.
       const code = error && typeof error === "object" && "code" in error
