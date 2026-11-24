@@ -12,6 +12,8 @@ type CartItem = { productId: number; quantity: number };
 type CartScreen = "cart" | "checkout" | "success" | "failed";
 type SimulationOutcome = "success" | "failed";
 type SimulationMethod = "mada" | "bank-card" | "apple-pay" | "stc-pay";
+type OrderItemSnapshot = { product_id: number; name: string; image: string | null; unit_price: number; quantity: number; line_total: number };
+type SavedOrder = { id: string; items: OrderItemSnapshot[]; total_amount: number; currency: string; payment_method: SimulationMethod; status: string; created_at: string };
 const MAX_CART_QUANTITY = 99;
 const simulationMethods: { id: SimulationMethod; name: string; description: string; logos: string[] }[] = [
   { id: "mada", name: "مدى", description: "بطاقة مدى البنكية", logos: ["/payment-methods/mada.svg"] },
@@ -19,6 +21,35 @@ const simulationMethods: { id: SimulationMethod; name: string; description: stri
   { id: "apple-pay", name: "Apple Pay", description: "محاكاة الدفع بمحفظة Apple", logos: ["/payment-methods/apple-pay.svg"] },
   { id: "stc-pay", name: "STC Pay", description: "محاكاة الدفع بالمحفظة الرقمية", logos: ["/payment-methods/stc-pay.svg"] },
 ];
+
+/**
+ * Stores one simulated order and resolves a retry of the same attempt.
+ * 1. Insert the order snapshot with its stable attempt key.
+ * 2. Read the existing order if an earlier request already saved that key.
+ * 3. Return the saved order ID or report the database failure.
+ */
+async function persistSimulatedOrder(items: OrderItemSnapshot[], total: number, method: SimulationMethod, attemptKey: string, userId: string): Promise<string> {
+  // STEP 1: Save the snapshot only after the simulation has succeeded.
+  const { data, error } = await supabase.from("orders")
+    .insert({ items, total_amount: total, payment_method: method, idempotency_key: attemptKey })
+    .select("id")
+    .single();
+  if (data?.id) return data.id;
+
+  // STEP 2: A timed-out response may have saved the order; reuse it on retry.
+  if (error?.code === "23505") {
+    const existing = await supabase.from("orders")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("idempotency_key", attemptKey)
+      .single();
+    if (existing.data?.id) return existing.data.id;
+    throw existing.error ?? error;
+  }
+
+  // STEP 3: Keep the cart when no saved order could be confirmed.
+  throw error ?? new Error("Order was not returned after insert.");
+}
 
 /**
  * Restores valid cart items saved for one account in this browser.
@@ -54,16 +85,21 @@ function readStoredCart(userId: string): CartItem[] {
 }
 
 /**
- * Displays the signed-in account, product catalog, editable cart, and payment simulation.
+ * Displays the signed-in account, catalog, cart, simulated checkout, and order history.
  * 1. Verify the account and restore its saved cart.
  * 2. Keep cart changes in browser storage and control the side dialog.
  * 3. Prepare account and cart totals for display.
- * 4. Render the header, product list, cart, and simulated checkout.
+ * 4. Render the header, product list, cart, simulated checkout, and order dialog.
  */
 export default function Dashboard() {
   const router = useRouter();
   const cartDialogRef = useRef<HTMLDialogElement>(null);
+  const ordersDialogRef = useRef<HTMLDialogElement>(null);
   const simulationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const paymentBusyRef = useRef(false);
+  const verifiedUserIdRef = useRef<string | null>(null);
+  const ordersRequestIdRef = useRef(0);
+  const pendingOrderRef = useRef<{ signature: string; key: string; method: SimulationMethod } | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [cart, setCart] = useState<CartItem[]>([]);
   const [cartOwnerId, setCartOwnerId] = useState<string | null>(null);
@@ -73,6 +109,12 @@ export default function Dashboard() {
   const [simulationOutcome, setSimulationOutcome] = useState<SimulationOutcome>("success");
   const [isSimulating, setIsSimulating] = useState(false);
   const [simulatedAmount, setSimulatedAmount] = useState(0);
+  const [savedOrderId, setSavedOrderId] = useState("");
+  const [orderSaveError, setOrderSaveError] = useState("");
+  const [isOrdersOpen, setIsOrdersOpen] = useState(false);
+  const [orders, setOrders] = useState<SavedOrder[]>([]);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+  const [ordersError, setOrdersError] = useState("");
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [signOutError, setSignOutError] = useState("");
@@ -100,6 +142,7 @@ export default function Dashboard() {
         }
 
         // STEP 3: Restore only this account's cart before enabling cart actions.
+        verifiedUserIdRef.current = data.user.id;
         setCart(readStoredCart(data.user.id));
         setCartOwnerId(data.user.id);
         setUser(data.user);
@@ -116,9 +159,15 @@ export default function Dashboard() {
       if (event === "SIGNED_OUT") {
         if (simulationTimerRef.current) clearTimeout(simulationTimerRef.current);
         simulationTimerRef.current = null;
+        paymentBusyRef.current = false;
+        pendingOrderRef.current = null;
+        verifiedUserIdRef.current = null;
+        ordersRequestIdRef.current += 1;
         setCart([]);
         setCartOwnerId(null);
         setIsCartOpen(false);
+        setIsOrdersOpen(false);
+        setOrders([]);
         setUser(null);
         router.replace("/");
       }
@@ -126,6 +175,8 @@ export default function Dashboard() {
 
     return () => {
       active = false;
+      verifiedUserIdRef.current = null;
+      ordersRequestIdRef.current += 1;
       subscription.unsubscribe();
     };
   }, [router]);
@@ -147,6 +198,13 @@ export default function Dashboard() {
     if (!isCartOpen && dialog.open) dialog.close();
   }, [isCartOpen]);
 
+  useEffect(() => {
+    const dialog = ordersDialogRef.current;
+    if (!dialog) return;
+    if (isOrdersOpen && !dialog.open) dialog.showModal();
+    if (!isOrdersOpen && dialog.open) dialog.close();
+  }, [isOrdersOpen]);
+
   useEffect(() => () => {
     if (simulationTimerRef.current) clearTimeout(simulationTimerRef.current);
   }, []);
@@ -154,6 +212,48 @@ export default function Dashboard() {
   function closeCart() {
     if (isSimulating) return;
     setIsCartOpen(false);
+  }
+
+  function closeOrders() {
+    ordersRequestIdRef.current += 1;
+    setIsOrdersOpen(false);
+  }
+
+  /**
+   * Opens the customer's order history and refreshes it from Supabase.
+   * 1. Reject requests without a verified account or during checkout.
+   * 2. Open the dialog and request this account's newest orders.
+   * 3. Show the rows or a recoverable loading error if the request is current.
+   */
+  async function openOrders() {
+    // STEP 1: Keep order history bound to the verified customer.
+    if (!user || verifiedUserIdRef.current !== user.id || isSimulating) return;
+    const userId = user.id;
+    const requestId = ++ordersRequestIdRef.current;
+
+    // STEP 2: Open one dialog and load fresh history for this account.
+    setIsCartOpen(false);
+    setIsOrdersOpen(true);
+    setOrdersLoading(true);
+    setOrdersError("");
+    try {
+      const { data, error } = await supabase.from("orders")
+        .select("id,items,total_amount,currency,payment_method,status,created_at")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      if (requestId !== ordersRequestIdRef.current || verifiedUserIdRef.current !== userId) return;
+      setOrders((data ?? []) as SavedOrder[]);
+    } catch {
+      // STEP 3: Let the customer retry without closing the dialog.
+      if (requestId === ordersRequestIdRef.current && verifiedUserIdRef.current === userId) {
+        setOrdersError("تعذّر تحميل طلباتك. حاول مرة أخرى.");
+      }
+    } finally {
+      if (requestId === ordersRequestIdRef.current && verifiedUserIdRef.current === userId) {
+        setOrdersLoading(false);
+      }
+    }
   }
 
   /**
@@ -191,31 +291,75 @@ export default function Dashboard() {
   }
 
   /**
-   * Simulates a payment result without contacting a payment provider.
-   * 1. Reject duplicate submissions or an empty, unverified cart.
-   * 2. Show a short processing state using the selected test outcome.
-   * 3. Clear the cart on simulated success or retain it on simulated failure.
+   * Completes the selected simulation and saves successful orders.
+   * 1. Show a rejected simulation without creating an order.
+   * 2. Save or recover the successful order using its attempt key.
+   * 3. Clear the cart only after the database confirms the saved order.
+   */
+  async function finishSimulatedPayment(outcome: SimulationOutcome, items: OrderItemSnapshot[], amount: number, method: SimulationMethod, attemptKey: string, userId: string) {
+    try {
+      // STEP 1: A rejected test payment never becomes an order.
+      if (outcome === "failed") {
+        if (verifiedUserIdRef.current === userId) setCartScreen("failed");
+        return;
+      }
+
+      // STEP 2: Confirm that the database saved this attempt exactly once.
+      const orderId = await persistSimulatedOrder(items, amount, method, attemptKey, userId);
+      if (verifiedUserIdRef.current !== userId) return;
+
+      // STEP 3: Show success and remove the saved products from the cart.
+      pendingOrderRef.current = null;
+      setSavedOrderId(orderId);
+      setSimulatedAmount(amount);
+      setCart([]);
+      setCartScreen("success");
+    } catch {
+      // STEP 3: Keep the cart and attempt key for a safe retry.
+      if (verifiedUserIdRef.current === userId) {
+        setOrderSaveError("نجحت المحاكاة، لكن تعذّر تأكيد حفظ الطلب. سلتك محفوظة؛ حاول مرة أخرى.");
+      }
+    } finally {
+      paymentBusyRef.current = false;
+      if (verifiedUserIdRef.current === userId) setIsSimulating(false);
+    }
+  }
+
+  /**
+   * Starts a simulated payment for the current verified cart.
+   * 1. Reject duplicate clicks and invalid checkout state.
+   * 2. Snapshot the cart and retain one key for retries of that cart.
+   * 3. Wait briefly before completing the simulated result.
    */
   function handleSimulatedPayment() {
-    // STEP 1: Only process a ready cart on the checkout screen.
-    if (cartScreen !== "checkout" || isSimulating || !user || cartOwnerId !== user.id || cart.length === 0) return;
-
-    // STEP 2: Make the simulated result visible after a short wait.
+    // STEP 1: Only process a ready cart once on the checkout screen.
+    if (cartScreen !== "checkout" || paymentBusyRef.current || !user || verifiedUserIdRef.current !== user.id || cartOwnerId !== user.id || cartLines.length === 0) return;
+    paymentBusyRef.current = true;
     setIsSimulating(true);
-    const selectedOutcome = simulationOutcome;
-    const amount = cartTotal;
+    setOrderSaveError("");
+
+    // STEP 2: Keep the same key when retrying a cart whose save result was uncertain.
+    const userId = user.id;
+    const items = cartLines.map(({ product, quantity }) => ({
+      product_id: product.id,
+      name: product.name,
+      image: product.image,
+      unit_price: product.price,
+      quantity,
+      line_total: product.price * quantity,
+    }));
+    const signature = JSON.stringify({ userId, items });
+    const pending = pendingOrderRef.current?.signature === signature
+      ? pendingOrderRef.current
+      : { signature, key: window.crypto.randomUUID(), method: simulationMethod };
+    if (simulationOutcome === "success") pendingOrderRef.current = pending;
+    const method = pending.method;
+    setSimulationMethod(method);
+
+    // STEP 3: Keep the existing visible processing pause before the result.
     simulationTimerRef.current = setTimeout(() => {
       simulationTimerRef.current = null;
-      setIsSimulating(false);
-
-      // STEP 3: Only the simulated success removes items from this browser's cart.
-      if (selectedOutcome === "success") {
-        setSimulatedAmount(amount);
-        setCart([]);
-        setCartScreen("success");
-      } else {
-        setCartScreen("failed");
-      }
+      void finishSimulatedPayment(simulationOutcome, items, cartTotal, method, pending.key, userId);
     }, 1300);
   }
 
@@ -267,30 +411,35 @@ export default function Dashboard() {
       <header className="dashboard-header">
         <div className="dashboard-header-inner">
           <div className="dashboard-brand">
-            <div className="brand" aria-label="رِواء">
+            <h1 className="brand" aria-label="رِواء">
               <span className="brand-mark" aria-hidden="true"><span /><span /><span /><span /></span>
               <span className="brand-name">رِواء<span className="brand-dot">.</span></span>
-            </div>
-            <span className="dashboard-header-divider" aria-hidden="true" />
-            <h1>لوحة التحكم</h1>
+            </h1>
           </div>
 
           {user ? (
             <div className="dashboard-account">
-              <span className="dashboard-avatar" aria-hidden="true">{initial}</span>
-              <div className="dashboard-person">
-                <strong>{displayName}</strong>
-                <span dir="ltr">{user.email ?? ""}</span>
+              <div className="dashboard-profile">
+                <span className="dashboard-avatar" aria-hidden="true">{initial}</span>
+                <div className="dashboard-person">
+                  <strong>{displayName}</strong>
+                  <span dir="ltr">{user.email ?? ""}</span>
+                </div>
               </div>
-              <button className="dashboard-cart-trigger" type="button" onClick={() => { setCartScreen("cart"); setIsCartOpen(true); }} aria-label={`افتح السلة، عدد القطع ${cartCount}`}>
-                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 8h16l-1.4 11H5.4L4 8ZM9 9V6a3 3 0 0 1 6 0v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                <span>السلة</span>
-                <span className="dashboard-cart-badge" aria-hidden="true">{cartCount}</span>
-              </button>
-              <button className="dashboard-signout" type="button" onClick={handleSignOut} disabled={isSigningOut}>
-                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3M14 8l4 4-4 4m4-4H9" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                <span>{isSigningOut ? "جارٍ الخروج..." : "تسجيل الخروج"}</span>
-              </button>
+              <div className="dashboard-header-actions">
+                <button className="dashboard-orders-trigger" type="button" onClick={() => { void openOrders(); }} aria-label="طلباتي" title="طلباتي">
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 4h10a2 2 0 0 1 2 2v14l-3-2-4 2-4-2-3 2V6a2 2 0 0 1 2-2Zm2 5h6M9 13h6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                  <span>طلباتي</span>
+                </button>
+                <button className="dashboard-cart-trigger" type="button" onClick={() => { setCartScreen("cart"); setIsCartOpen(true); }} aria-label={`افتح السلة، عدد القطع ${cartCount}`} title="السلة">
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 8h16l-1.4 11H5.4L4 8ZM9 9V6a3 3 0 0 1 6 0v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                  <span>السلة</span>
+                  <span className="dashboard-cart-badge" aria-hidden="true">{cartCount}</span>
+                </button>
+                <button className="dashboard-signout" type="button" onClick={handleSignOut} disabled={isSigningOut} aria-label={isSigningOut ? "جارٍ تسجيل الخروج" : "تسجيل الخروج"} title="تسجيل الخروج">
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3M14 8l4 4-4 4m4-4H9" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                </button>
+              </div>
             </div>
           ) : (
             <span className="dashboard-checking" role="status">{loadError || "جارٍ تحميل حسابك..."}</span>
@@ -343,7 +492,7 @@ export default function Dashboard() {
         ref={cartDialogRef}
         className="dashboard-cart-dialog"
         aria-labelledby="cart-title"
-        onClose={() => { setIsCartOpen(false); setCartScreen("cart"); setSimulationMethod("mada"); setSimulationOutcome("success"); }}
+        onClose={() => { setIsCartOpen(false); setCartScreen("cart"); setOrderSaveError(""); if (!pendingOrderRef.current) setSimulationMethod("mada"); setSimulationOutcome("success"); }}
         onCancel={(event) => { if (isSimulating) event.preventDefault(); }}
         onClick={(event) => { if (event.target === event.currentTarget) closeCart(); }}
       >
@@ -396,18 +545,21 @@ export default function Dashboard() {
                 </label>
               </fieldset>
               <div className="dashboard-simulation-actions">
+                {orderSaveError && <p className="dashboard-order-save-error" role="alert">{orderSaveError}</p>}
                 <button className="dashboard-simulation-pay" type="button" onClick={handleSimulatedPayment} disabled={isSimulating}>
-                  {isSimulating ? <><span className="dashboard-simulation-spinner" aria-hidden="true" />جارٍ تنفيذ المحاكاة...</> : `تأكيد الدفع التجريبي · ${cartTotal.toLocaleString("en-US")} ر.س`}
+                  {isSimulating ? <><span className="dashboard-simulation-spinner" aria-hidden="true" />جارٍ تأكيد الطلب...</> : orderSaveError ? "إعادة محاولة حفظ الطلب" : `تأكيد الدفع التجريبي · ${cartTotal.toLocaleString("en-US")} ر.س`}
                 </button>
-                <button className="dashboard-simulation-back" type="button" onClick={() => setCartScreen("cart")} disabled={isSimulating}>العودة إلى السلة</button>
+                <button className="dashboard-simulation-back" type="button" onClick={() => { setOrderSaveError(""); setCartScreen("cart"); }} disabled={isSimulating}>العودة إلى السلة</button>
               </div>
             </div>
           ) : cartScreen === "success" ? (
             <div className="dashboard-simulation-result" role="status">
               <span className="dashboard-simulation-result-icon success" aria-hidden="true">✓</span>
-              <h3>نجحت المحاكاة</h3>
+              <h3>تم حفظ طلبك التجريبي</h3>
               <p>تمت تجربة دفع عبر {selectedSimulationMethod.name} بقيمة {simulatedAmount.toLocaleString("en-US")} ر.س. لم تُرسل أي عملية إلى Tap ولم يُخصم أي مبلغ.</p>
-              <button type="button" onClick={closeCart}>العودة إلى المنتجات</button>
+              <span className="dashboard-saved-order-id">رقم الطلب <b dir="ltr">{savedOrderId.slice(0, 8).toUpperCase()}</b></span>
+              <button type="button" onClick={() => { void openOrders(); }}>عرض طلباتي</button>
+              <button className="dashboard-simulation-result-secondary" type="button" onClick={closeCart}>العودة إلى المنتجات</button>
             </div>
           ) : cartScreen === "failed" ? (
             <div className="dashboard-simulation-result" role="status">
@@ -456,6 +608,63 @@ export default function Dashboard() {
               </div>
             </>
           )}
+        </div>
+      </dialog>
+      <dialog
+        ref={ordersDialogRef}
+        className="dashboard-orders-dialog"
+        aria-labelledby="orders-title"
+        onClose={closeOrders}
+        onClick={(event) => { if (event.target === event.currentTarget) closeOrders(); }}
+      >
+        <div className="dashboard-orders-panel">
+          <div className="dashboard-cart-heading">
+            <div>
+              <p>سجل مشترياتك من رِواء</p>
+              <h2 id="orders-title">طلباتي السابقة</h2>
+            </div>
+            <button className="dashboard-cart-close" type="button" onClick={closeOrders} aria-label="إغلاق الطلبات">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 5 14 14M19 5 5 19" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /></svg>
+            </button>
+          </div>
+          <div className="dashboard-orders-body" aria-live="polite">
+            {ordersLoading ? (
+              <div className="dashboard-orders-state"><span className="dashboard-orders-spinner" aria-hidden="true" /><p>جارٍ تحميل طلباتك...</p></div>
+            ) : ordersError ? (
+              <div className="dashboard-orders-state"><p role="alert">{ordersError}</p><button type="button" onClick={() => { void openOrders(); }}>إعادة المحاولة</button></div>
+            ) : orders.length === 0 ? (
+              <div className="dashboard-orders-state"><span className="dashboard-orders-empty-icon" aria-hidden="true">✦</span><h3>لا توجد طلبات بعد</h3><p>ستظهر طلباتك هنا بعد نجاح تجربة الدفع وحفظها.</p></div>
+            ) : (
+              <div className="dashboard-orders-list">
+                <p className="dashboard-orders-note">كل الطلبات المعروضة تجريبية، ولم يُخصم عنها أي مبلغ.</p>
+                {orders.map((order) => (
+                  <details className="dashboard-order-card" key={order.id}>
+                    <summary>
+                      <span className="dashboard-order-summary-top"><strong>طلب #{order.id.slice(0, 8).toUpperCase()}</strong><span>تجريبي</span></span>
+                      <span className="dashboard-order-summary-bottom">
+                        <time dateTime={order.created_at}>{new Date(order.created_at).toLocaleString("ar-SA-u-ca-gregory", { dateStyle: "medium", timeStyle: "short" })}</time>
+                        <b>{Number(order.total_amount).toLocaleString("en-US")} ر.س</b>
+                      </span>
+                      <span className="dashboard-order-summary-hint">{simulationMethods.find((method) => method.id === order.payment_method)?.name ?? order.payment_method} · عرض المنتجات</span>
+                    </summary>
+                    <div className="dashboard-order-details">
+                      {(Array.isArray(order.items) ? order.items.filter((item) => item && typeof item.name === "string") : []).map((item, index) => (
+                        <div className="dashboard-order-item" key={`${item.product_id}-${index}`}>
+                          <span className="dashboard-order-item-image">
+                            {typeof item.image === "string" && item.image.startsWith("/products/")
+                              ? <Image src={item.image} alt="" width={54} height={54} />
+                              : <span aria-hidden="true">رِواء</span>}
+                          </span>
+                          <span className="dashboard-order-item-copy"><strong>{item.name}</strong><small>{item.quantity} × {Number(item.unit_price).toLocaleString("en-US")} ر.س</small></span>
+                          <b>{Number(item.line_total).toLocaleString("en-US")} ر.س</b>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </dialog>
     </main>
